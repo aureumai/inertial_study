@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 import py_bsm_lib as pbl
 from sqlalchemy.sql.functions import current_timestamp
 
+from inertia import underlying
 
 pio.renderers.default = 'browser'
 
@@ -154,6 +155,18 @@ def get_vol(day, coineal_engine):
     return vol
 
 
+def get_underlying(timestamp, coineal_engine):
+    table = Table(f"candles_spx", MetaData(), autoload_with=coineal_engine)
+    query = select(table.c.candle_close, table.c.close).where(table.c.candle_close == timestamp)
+
+    ohlc = execute_query(query, coineal_engine)
+    ohlc = pd.DataFrame.from_records(ohlc, columns=["timestamp", "close"])
+    try:
+        return ohlc["close"].values[0]
+    except:
+        return None
+
+
 @lru_cache
 def parse_option_string(row):
     return tuple(re.findall(r"[^\W\d_]+|\d+", row[0]))
@@ -182,6 +195,7 @@ db = "trades"
 
 ticker = "SPX"
 rfr = 0.0055
+dividend = 0
 reconstructed_columns = ['charm', 'dag', 'delta', 'expiration', 'gamma', 'kind', 'owner',
                                       'rho', 'size', 'strike', 'symbol', 'theta', 'ticker', 'vanna',
                                       'vega', 'vomma', "iv", "value"]
@@ -191,6 +205,7 @@ dates = [datetime(2024,10,11), datetime(2024,10,14), datetime(2024,10,15),
          datetime(2024,10,23)]
 inertia_by_date = {}
 for date in dates:
+    daily_tracking = {}
     print(f"Processing date: {date.strftime('%Y-%m-%d')}")
     production_engine = create_engine(f'postgresql://{user}:{password}@{host}/{db}')
     historia_engine = create_engine(f'postgresql://{user}:{password}@3.236.21.93/Historia')
@@ -201,6 +216,7 @@ for date in dates:
     # go back to the previous day
     current_timestamp = (date - timedelta(days=1)).replace(hour=15, minute=0, tzinfo=ZoneInfo("America/New_York"))
     while current_timestamp.time() <= time(16, 0):
+        underlying = get_underlying(current_timestamp.timestamp(), coinneal_engine)
         table = Table(f'full_options_spx', MetaData(), autoload_with=production_engine)
         query = (select(table.c.symbol, table.c.owner, func.sum(func.cast(table.c.size, Integer)))
                  .where(and_(func.cast(table.c.expiration, Integer) == int(date.strftime('%y%m%d'))),
@@ -213,73 +229,58 @@ for date in dates:
 
         trades = production_trades + historia_trades
 
+        pl_df = pl.DataFrame([{"symbol": item[0], "owner": item[1],
+                               "size": item[2]} for item in trades])
+        pl_df = pl_df.with_columns(pl.col("symbol").map_elements(lambda s: s.split(":")[-1] if ":" in s else s, return_dtype=pl.String))
+        pl_df = pl_df.with_columns(pl_df.map_rows(lambda s: parse_option_string(s)))
+        pl_df = pl_df.rename({"column_0": "ticker", "column_1": "expiration", "column_2": "kind", "column_3": "strike"})
+        pl_df = pl_df[["symbol", "owner", "size", "ticker", "expiration", "kind", "strike"]]
+        pl_df = pl_df.with_columns(
+            pl.when(pl.col('expiration').str.len_chars() > 6).then(pl.col("expiration").str.slice(1)).otherwise(
+                pl.col("expiration")).alias('expiration'))
+        pl_df = pl_df.with_columns(pl.col("expiration").cast(pl.Int64, strict=False).alias("expiration"))
+        pl_df = pl_df.with_columns(pl.col("strike").cast(pl.Int64) / 1000)
+        pl_df = pl_df.with_columns(
+            pl.when(pl.col("kind") == 'C').then(pl.lit("call")).otherwise(pl.lit("put")).alias('kind'))
 
-underlying, vol, dividend = get_underlying()
+        columns = pl_df.columns
+        pl_df = pl_df.with_columns(
+            pl_df['expiration'].map_elements(lambda x: datetime.strptime(str(x), "%y%m%d"), return_dtype=pl.Datetime))
+        pl_df = pl_df.with_columns(
+            pl_df.map_rows(
+                lambda row: handle_time(row[columns.index("ticker")], row[columns.index("expiration")])))
+        pl_df = pl_df.rename({"map": "t"})
+        pl_df = pl_df.filter(pl.col('t') > 0)
 
+        columns = pl_df.columns
+        updated_data = pl_df.map_rows(
+            lambda row: rust_update(row, vol, underlying, rfr, dividend, columns))
+        updated_data = updated_data.rename(
+            {k: v for k, v in zip(updated_data.columns, reconstructed_columns)})
 
-pl_df = pl.DataFrame([{"symbol": item[0], "owner": item[1],
-                       "size": item[2]} for item in production_trades])
-pl_df = pl_df.with_columns(pl.col("symbol").map_elements(lambda s: s.split(":")[-1] if ":" in s else s, return_dtype=pl.String))
-pl_df = pl_df.with_columns(pl_df.map_rows(lambda s: parse_option_string(s)))
-pl_df = pl_df.rename({"column_0": "ticker", "column_1": "expiration", "column_2": "kind", "column_3": "strike"})
-pl_df = pl_df[["symbol", "owner", "size", "ticker", "expiration", "kind", "strike"]]
-pl_df = pl_df.with_columns(
-    pl.when(pl.col('expiration').str.len_chars() > 6).then(pl.col("expiration").str.slice(1)).otherwise(
-        pl.col("expiration")).alias('expiration'))
-pl_df = pl_df.with_columns(pl.col("expiration").cast(pl.Int64, strict=False).alias("expiration"))
-pl_df = pl_df.with_columns(pl.col("strike").cast(pl.Int64) / 1000)
-pl_df = pl_df.with_columns(
-    pl.when(pl.col("kind") == 'C').then(pl.lit("call")).otherwise(pl.lit("put")).alias('kind'))
+        updated_data = updated_data.with_columns(
+            pl.when(pl.col('delta').abs() <= 0.5).then(pl.col('delta').abs() * pl.col('vanna')).otherwise(
+                (1 - pl.col('delta').abs()) * pl.col('vanna')).alias('vanna'))
 
-columns = pl_df.columns
-pl_df = pl_df.with_columns(
-    pl_df['expiration'].map_elements(lambda x: datetime.strptime(str(x), "%y%m%d"), return_dtype=pl.Datetime))
-pl_df = pl_df.with_columns(
-    pl_df.map_rows(
-        lambda row: handle_time(row[columns.index("ticker")], row[columns.index("expiration")])))
-pl_df = pl_df.rename({"map": "t"})
-pl_df = pl_df.filter(pl.col('t') > 0)
+        options_institution = updated_data.filter(pl.col("owner") == "institution")
+        options_consumer = updated_data.filter(pl.col("owner") == "consumer")
 
-columns = pl_df.columns
-updated_data = pl_df.map_rows(
-    lambda row: rust_update(row, vol, underlying, rfr, dividend, columns))
-updated_data = updated_data.rename(
-    {k: v for k, v in zip(updated_data.columns, reconstructed_columns)})
+        options_institution = options_institution.with_columns(pl.col("vanna") * pl.col("size"))
+        options_consumer = options_consumer.with_columns(pl.col("vanna") * pl.col("size"))
 
-updated_data = updated_data.with_columns(
-    pl.when(pl.col('delta').abs() <= 0.5).then(pl.col('delta').abs() * pl.col('vanna')).otherwise(
-        (1 - pl.col('delta').abs()) * pl.col('vanna')).alias('vanna'))
+        options_institution = options_institution.drop(
+            ['owner', 'size', 'symbol', 'ticker', 'dag', 'delta',
+             'rho', 'theta', 'charm', 'vomma', "gamma", "iv", "value"])
+        options_consumer = options_consumer.drop(
+            ['owner', 'size', 'symbol', 'ticker', 'dag', 'delta', 'rho',
+             'theta', 'charm', 'vomma', "gamma", "iv", "value"])
 
-options_institution = updated_data.filter(pl.col("owner") == "institution")
-options_consumer = updated_data.filter(pl.col("owner") == "consumer")
+        strike_group1 = options_institution.to_pandas().groupby(['expiration', 'strike', 'kind']).sum()
+        strike_group2 = options_consumer.to_pandas().groupby(['expiration', 'strike', 'kind']).sum()
+        strike_groups = strike_group1.subtract(strike_group2, fill_value=0)
+        for col in strike_groups.columns:
+            strike_groups[col] = strike_groups[col] * 100 * underlying
 
-options_institution = options_institution.with_columns(pl.col("vanna") * pl.col("size"))
-options_consumer = options_consumer.with_columns(pl.col("vanna") * pl.col("size"))
-
-options_institution = options_institution.drop(
-    ['owner', 'size', 'symbol', 'ticker', 'dag', 'delta',
-     'rho', 'theta', 'charm', 'vomma', "gamma", "iv", "value"])
-options_consumer = options_consumer.drop(
-    ['owner', 'size', 'symbol', 'ticker', 'dag', 'delta', 'rho',
-     'theta', 'charm', 'vomma', "gamma", "iv", "value"])
-
-strike_group1 = options_institution.to_pandas().groupby(['expiration', 'strike', 'kind']).sum()
-strike_group2 = options_consumer.to_pandas().groupby(['expiration', 'strike', 'kind']).sum()
-strike_groups = strike_group1.subtract(strike_group2, fill_value=0)
-for col in strike_groups.columns:
-    strike_groups[col] = strike_groups[col] * 100 * underlying
-
-strike_groups.reset_index(inplace=True)
-expirations = list(set(strike_groups['expiration']))
-
-overall_vanna_inertia = calculate_vanna_inertia(underlying, strike_groups)
-inertias = {}
-for expiration in expirations:
-    subset = strike_groups[strike_groups['expiration'] == expiration]
-    inertias[expiration] = calculate_vanna_inertia(underlying, subset)
-
-fig = go.Figure()
-fig.add_trace(go.Bar(x=list(inertias.keys()), y=list(inertias.values()), name="Inertia By Expiration"))
-fig.add_hline(y=overall_vanna_inertia)
-fig.update_layout(title="Inertia By Expiration")
-fig.show()
+        strike_groups.reset_index(inplace=True)
+        vanna_inertia = calculate_vanna_inertia(underlying, strike_groups)
+        daily_tracking[current_timestamp] = vanna_inertia
